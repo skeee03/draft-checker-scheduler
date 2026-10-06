@@ -12,7 +12,7 @@ final class DCS_Plugin {
 	const VOID = ['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'];
 	const TZ = 'Asia/Dhaka'; // scheduling timezone (UTC+6)
 	const VER = '10';
-	const REPO = ''; // GitHub repo URL for auto-updates, e.g. 'https://github.com/user/draft-checker-scheduler/' (or set it on the plugin page)
+	const REPO = 'https://github.com/skeee03/draft-checker-scheduler'; // GitHub repo used for auto-updates (can be overridden on the plugin page)
 	const AUD_TZ = 'America/New_York'; // default audience timezone (US Eastern)
 	static $zones = [
 		'America/New_York'    => 'US Eastern (ET)',
