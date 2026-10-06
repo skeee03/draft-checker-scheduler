@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Draft Checker & Scheduler
  * Description: Scans draft posts (broken HTML/blocks, cut-off articles, stray characters, image domains), then offers one-click fixes (per post, per category, or all) with undo, plus bulk scheduling of clean drafts.
- * Version: 4.0.0
+ * Version: 4.0.1
  * Author: Salman
  */
 if (!defined('ABSPATH')) exit;
