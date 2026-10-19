@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Draft Checker & Scheduler
  * Description: Scans draft posts (broken HTML/blocks, cut-off articles, stray characters, image domains), then offers one-click fixes (per post, per category, or all) with undo, plus bulk scheduling of clean drafts.
- * Version: 4.0.1
+ * Version: 4.1.0
  * Author: Salman
  */
 if (!defined('ABSPATH')) exit;
@@ -11,7 +11,8 @@ final class DCS_Plugin {
 	const SLUG = 'draft-checker-scheduler';
 	const VOID = ['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'];
 	const TZ = 'Asia/Dhaka'; // scheduling timezone (UTC+6)
-	const VER = '10';
+	const VER = '11';
+	const MARK = '/(?:={2,}\s*[A-Za-z][A-Za-z0-9_ \-]{0,30}?\s*={2,})|(?:(?:-{3,}|#{3,}|\*{3,}|_{3,})\s*[A-Z][A-Z0-9_ \-]{1,30}?\s*(?:-{3,}|#{3,}|\*{3,}|_{3,}))/u';
 	const REPO = 'https://github.com/skeee03/draft-checker-scheduler'; // GitHub repo used for auto-updates (can be overridden on the plugin page)
 	const AUD_TZ = 'America/New_York'; // default audience timezone (US Eastern)
 	static $zones = [
@@ -31,11 +32,13 @@ final class DCS_Plugin {
 		'nl'     => 'Literal \n characters',
 		'cite'   => 'AI citation leftovers',
 		'brackets' => 'Remove paragraphs that contain only [bracket text]',
+		'stray'  => 'Remove stray one-word paragraphs (e.g. "In")',
+		'markers' => 'Remove leaked markers (===HTML=== etc.)',
 	];
 
 	static function init() {
 		add_action('admin_menu', [__CLASS__, 'menu']);
-		foreach (['scan', 'preview', 'apply', 'unsched', 'restore', 'fix', 'settings'] as $a) add_action('wp_ajax_dcs_' . $a, [__CLASS__, 'ajax_' . $a]);
+		foreach (['scan', 'preview', 'apply', 'unsched', 'restore', 'fix', 'settings', 'setstatus'] as $a) add_action('wp_ajax_dcs_' . $a, [__CLASS__, 'ajax_' . $a]);
 	}
 
 	// GitHub auto-updates (single file, no library). WordPress checks the latest *Release* of your GitHub repo; when its tag
@@ -137,7 +140,7 @@ final class DCS_Plugin {
 		if (strpos($nocom, '\n') !== false) $add('warn', 'Literal "\\n" characters in content', $code ? null : 'nl');
 
 		self::block_issues($c, $add);
-		if (!$code) self::bracket_issues($nocom, $add);
+		if (!$code) { self::bracket_issues($nocom, $add); self::stray_issues($nocom, $add); self::marker_issues($nocom, $add); self::trunc_issues($nocom, $add); }
 		self::tag_issues($nocom, $add);
 		self::dom_issues($nocom, $add);
 		self::extra_issues($c, $nocom, $text, $add);
@@ -169,6 +172,91 @@ final class DCS_Plugin {
 		$t = html_entity_decode(wp_strip_all_tags($inner), ENT_QUOTES, 'UTF-8');
 		$t = trim(preg_replace('/[\s\x{00A0}]+/u', ' ', $t));
 		return $t !== '' && preg_match('/^(?:\[[^\[\]]+\]\s*)+$/u', $t) === 1;
+	}
+
+	/* ---- stray one-word paragraphs, leaked markers, cut-off paragraphs ---- */
+
+	static function ptext($inner) {
+		$t = html_entity_decode(wp_strip_all_tags($inner), ENT_QUOTES, 'UTF-8');
+		return trim(preg_replace('/[\s\x{00A0}]+/u', ' ', $t));
+	}
+
+	// True when the offset sits inside a table cell, list item, caption or quote (short text is normal there).
+	static function in_cell($h, $off) {
+		$pre = substr($h, 0, $off);
+		foreach (['td', 'th', 'li', 'figcaption', 'blockquote'] as $t) {
+			if (preg_match_all('#<' . $t . '\b#i', $pre) > preg_match_all('#</' . $t . '>#i', $pre)) return true;
+		}
+		return false;
+	}
+
+	// A paragraph that is just 1-5 plain letters (e.g. "In") with no bold/italic/link formatting.
+	static function stray_only($inner) {
+		if (preg_match('#<(?:strong|b|em|i|a|mark|u|span)\b#i', $inner)) return false;
+		return preg_match('/^\p{L}{1,5}$/u', self::ptext($inner)) === 1;
+	}
+
+	static function marker_only($inner) {
+		$t = self::ptext($inner);
+		return $t !== '' && preg_match(self::MARK, $t) === 1 && trim(preg_replace(self::MARK, '', $t)) === '';
+	}
+
+	static function find_paras($h, $pred) {
+		$hit = [];
+		if (preg_match_all('#<p\b[^>]*>(.*?)</p>#is', $h, $m, PREG_SET_ORDER | PREG_OFFSET_CAPTURE)) {
+			foreach ($m as $x) if ($pred($x[1][0]) && !self::in_cell($h, $x[0][1])) $hit[] = $x;
+		}
+		return $hit;
+	}
+
+	static function line_of($h, $off) { return substr_count(substr($h, 0, $off), "\n") + 1; }
+
+	static function stray_issues($h, $add) {
+		$hit = self::find_paras($h, ['DCS_Plugin', 'stray_only']);
+		if (!$hit) return;
+		$add('error', count($hit) . ' stray one-word paragraph(s), e.g. "' . self::ptext($hit[0][1][0]) . '" [line ' . self::line_of($h, $hit[0][0][1]) . '] (cut-off text?)', 'stray');
+	}
+
+	static function marker_issues($h, $add) {
+		$t = self::ptext($h);
+		if (!preg_match_all(self::MARK, $t, $m)) return;
+		$ex = array_values(array_unique(array_map('trim', $m[0])));
+		$add('error', count($m[0]) . ' leaked marker(s) in the text: ' . self::cap(array_map(function ($x) { return '"' . $x . '"'; }, $ex), 3), 'markers');
+	}
+
+	static function trunc_issues($h, $add) {
+		static $stop = ['in','the','a','an','of','to','and','or','for','with','on','at','by','from','as','is','are','was','were','that','this','which','but','if','when','than','into','your','their','its','our','my'];
+		$hit = self::find_paras($h, function ($inner) use ($stop) {
+			$t = self::ptext($inner);
+			if ($t === '' || str_word_count($t) < 3 || preg_match('/[.!?:;)\]"\x{201D}\x{2019}\x{00BB}\x{2026}\'*]$/u', $t)) return false;
+			if (substr($t, -1) === ',') return true;
+			$w = preg_split('/\s+/u', mb_strtolower($t));
+			return in_array(end($w), $stop, true);
+		});
+		if (!$hit) return;
+		$t = self::ptext($hit[0][1][0]);
+		$add('warn', count($hit) . ' paragraph(s) seem to end mid-sentence (cut off?), e.g. "…' . mb_substr($t, -40) . '" [line ' . self::line_of($h, $hit[0][0][1]) . ']');
+	}
+
+	// Removes whole <p> blocks (and their Gutenberg paragraph comments) for which $pred(innerHtml) is true; never inside cells/lists.
+	static function remove_paras($c, $pred) {
+		foreach (['#<!--\s*wp:paragraph(?:\s+\{.*?\})?\s*-->\s*<p\b[^>]*>(.*?)</p>\s*<!--\s*/wp:paragraph\s*-->[ \t]*\R?#is', '#<p\b[^>]*>(.*?)</p>[ \t]*\R?#is'] as $re) {
+			if (!preg_match_all($re, $c, $m, PREG_SET_ORDER | PREG_OFFSET_CAPTURE)) continue;
+			for ($k = count($m) - 1; $k >= 0; $k--) {
+				if ($pred($m[$k][1][0]) && !self::in_cell($c, $m[$k][0][1])) $c = substr_replace($c, '', $m[$k][0][1], strlen($m[$k][0][0]));
+			}
+		}
+		return $c;
+	}
+
+	static function fix_stray($c) { return self::remove_paras($c, ['DCS_Plugin', 'stray_only']); }
+
+	static function fix_markers($c) {
+		$c = self::remove_paras($c, ['DCS_Plugin', 'marker_only']);
+		$parts = preg_split('/(<[^>]*>)/', $c, -1, PREG_SPLIT_DELIM_CAPTURE);
+		if (!is_array($parts)) return $c;
+		foreach ($parts as $i => $seg) if ($i % 2 === 0 && strpos($seg, '<!--') === false && preg_match(self::MARK, $seg)) $parts[$i] = preg_replace('/ {2,}/', ' ', preg_replace(self::MARK, '', $seg));
+		return implode('', $parts);
 	}
 
 	static function bracket_issues($h, $add) {
@@ -672,6 +760,8 @@ final class DCS_Plugin {
 			$step('chars', $n);
 		}
 		if (in_array('brackets', $cats, true) && !$code) $step('brackets', self::fix_brackets($c));
+		if (in_array('stray', $cats, true) && !$code) $step('stray', self::fix_stray($c));
+		if (in_array('markers', $cats, true) && !$code) $step('markers', self::fix_markers($c));
 		if (in_array('tags', $cats, true)) $step('tags', self::fix_tags($c));
 		if (in_array('tables', $cats, true)) $step('tables', self::strip_maxw($c));
 		if (in_array('contrast', $cats, true)) $step('contrast', self::fix_contrast($c));
@@ -680,7 +770,7 @@ final class DCS_Plugin {
 
 	static function fix_post($id, $cats) {
 		$p = get_post($id);
-		if (!$p || $p->post_status !== 'draft' || !self::fresh($id, $p)) return 0;
+		if (!$p || !self::okst($p) || !self::fresh($id, $p)) return 0;
 		$have = [];
 		foreach ((array) get_post_meta($id, '_dcs_issues', true) as $i) if (!empty($i['f'])) $have[$i['f']] = 1;
 		$use = $cats ? array_values(array_intersect($cats, array_keys($have))) : array_keys($have);
@@ -722,7 +812,7 @@ final class DCS_Plugin {
 
 	static function scan_post($id) {
 		$p = get_post($id);
-		if (!$p || $p->post_status !== 'draft') return;
+		if (!$p || !self::okst($p)) return;
 		$prev = get_post_meta($id, '_dcs_hash', true);
 		if ($prev !== md5($p->post_content)) { delete_post_meta($id, '_dcs_fixes'); delete_post_meta($id, '_dcs_backup'); }
 		self::rescan($id);
@@ -777,7 +867,7 @@ final class DCS_Plugin {
 		foreach (self::ids_post() as $id) {
 			$p = get_post($id);
 			$b = get_post_meta($id, '_dcs_backup', true);
-			if (!$p || $p->post_status !== 'draft' || !$b) continue;
+			if (!$p || !self::okst($p) || !$b) continue;
 			wp_update_post(['ID' => $id, 'post_content' => wp_slash($b)]);
 			delete_post_meta($id, '_dcs_backup'); delete_post_meta($id, '_dcs_fixes');
 			self::rescan($id);
@@ -792,8 +882,8 @@ final class DCS_Plugin {
 		foreach (self::ids_post() as $id) {
 			if (get_post_status($id) === 'future' && get_post_meta($id, '_dcs_sched', true) === '1') {
 				$p = get_post($id); $o = get_post_meta($id, '_dcs_orig_date', true);
-				$dt = (is_array($o) && count($o) === 2) ? $o : [$p->post_modified, $p->post_modified_gmt]; // original draft date (older schedules: last-modified time)
-				wp_update_post(['ID' => $id, 'post_status' => 'draft', 'post_date' => $dt[0], 'post_date_gmt' => $dt[1], 'edit_date' => true]);
+				$dt = (is_array($o) && count($o) >= 2) ? $o : [$p->post_modified, $p->post_modified_gmt]; // original draft date (older schedules: last-modified time)
+				wp_update_post(['ID' => $id, 'post_status' => (isset($dt[2]) && $dt[2] === 'pending') ? 'pending' : 'draft', 'post_date' => $dt[0], 'post_date_gmt' => $dt[1], 'edit_date' => true]);
 				delete_post_meta($id, '_dcs_sched'); delete_post_meta($id, '_dcs_orig_date');
 				$n++;
 			}
@@ -803,9 +893,35 @@ final class DCS_Plugin {
 
 	/* ---------------------------------------------------------- SCHEDULING */
 
-	static function draft_ids() {
-		return get_posts(['post_type' => 'post', 'post_status' => 'draft', 'numberposts' => -1, 'fields' => 'ids',
+	// Post statuses the user chose to scan (Draft / Pending / Published / Scheduled). Default: drafts only.
+	static function statuses() {
+		$s = array_values(array_intersect((array) get_option('dcs_statuses', ['draft']), ['draft', 'pending', 'publish', 'future']));
+		return $s ?: ['draft'];
+	}
+
+	static function okst($p) { return in_array($p->post_status, ['draft', 'pending', 'publish', 'future'], true); }
+
+	static function stlabel($st) { $l = ['draft' => 'Draft', 'pending' => 'Pending', 'publish' => 'Published', 'future' => 'Scheduled']; return isset($l[$st]) ? $l[$st] : $st; }
+
+	static function scan_ids() {
+		return get_posts(['post_type' => 'post', 'post_status' => self::statuses(), 'numberposts' => -1, 'fields' => 'ids',
 			'orderby' => 'date', 'order' => 'ASC', 'no_found_rows' => true]);
+	}
+
+	// Posts that can be bulk-scheduled: only Draft / Pending, and only if that status is ticked.
+	static function sched_ids() {
+		$st = array_values(array_intersect(self::statuses(), ['draft', 'pending']));
+		if (!$st) return [];
+		return get_posts(['post_type' => 'post', 'post_status' => $st, 'numberposts' => -1, 'fields' => 'ids',
+			'orderby' => 'date', 'order' => 'ASC', 'no_found_rows' => true]);
+	}
+
+	static function ajax_setstatus() {
+		self::guard();
+		$st = json_decode(wp_unslash($_POST['st'] ?? '[]'), true);
+		$st = is_array($st) ? array_values(array_intersect($st, ['draft', 'pending', 'publish', 'future'])) : [];
+		update_option('dcs_statuses', $st ?: ['draft'], false);
+		wp_send_json_success();
 	}
 
 	static function slots($n, $a, $b, $gap) {
@@ -841,7 +957,7 @@ final class DCS_Plugin {
 
 		$incl = $g('warn') === '1';
 		$ids = []; $stale = 0;
-		foreach (self::draft_ids() as $id) {
+		foreach (self::sched_ids() as $id) {
 			$st = self::fresh($id, get_post($id));
 			if (!$st) { $stale++; continue; }
 			if ($st === 'ok' || ($incl && $st === 'warn')) $ids[] = $id;
@@ -874,12 +990,12 @@ final class DCS_Plugin {
 		foreach ($items as $it) {
 			$id = (int) ($it['id'] ?? 0); $ts = (int) ($it['ts'] ?? 0);
 			$p = get_post($id);
-			if (!$p || $p->post_status !== 'draft') { $skipped[] = "#$id not a draft"; continue; }
+			if (!$p || !in_array($p->post_status, ['draft', 'pending'], true)) { $skipped[] = "#$id is not a draft/pending post"; continue; }
 			$st = self::fresh($id, $p);
 			if (!in_array($st, ['ok', 'warn'], true)) { $skipped[] = "#$id changed since scan"; continue; }
 			if ($ts < time() + 60) { $skipped[] = "#$id time already passed"; continue; }
 			$gmt = gmdate('Y-m-d H:i:s', $ts);
-			update_post_meta($id, '_dcs_orig_date', [$p->post_date, $p->post_date_gmt]);
+			update_post_meta($id, '_dcs_orig_date', [$p->post_date, $p->post_date_gmt, $p->post_status]);
 			$r = wp_update_post(['ID' => $id, 'post_status' => 'future', 'post_date' => get_date_from_gmt($gmt), 'post_date_gmt' => $gmt, 'edit_date' => true], true);
 			if (is_wp_error($r) || get_post_status($id) !== 'future') { delete_post_meta($id, '_dcs_orig_date'); $skipped[] = "#$id could not be scheduled"; continue; }
 			update_post_meta($id, '_dcs_sched', '1');
@@ -892,7 +1008,8 @@ final class DCS_Plugin {
 
 	static function render() {
 		if (!current_user_can('edit_others_posts')) return;
-		$ids = self::draft_ids();
+		$ids = self::scan_ids();
+		$sts = self::statuses();
 		_prime_post_caches($ids, false, true);
 		update_meta_cache('post', $ids);
 		$cnt = ['ok' => 0, 'warn' => 0, 'error' => 0, 'stale' => 0];
@@ -921,7 +1038,7 @@ final class DCS_Plugin {
 				if ($hasBackup) { $undo[] = (int) $id; $act .= '<br><a href="#" class="dcs-undo-fix" data-id="' . (int) $id . '">Undo fixes</a>'; }
 			}
 			$rows .= '<tr data-s="' . esc_attr($key) . '"><td>' . (int) $id . '</td><td><a href="' . esc_url(get_edit_post_link($id)) . '" target="_blank">'
-				. esc_html(get_the_title($id) ?: '(no title)') . '</a><br><a href="' . esc_url(get_preview_post_link($id)) . '" target="_blank">Preview (check on phone)</a></td><td><span class="dcs-b dcs-b-' . esc_attr($key) . '">' . esc_html($labels[$key]) . '</span>' . $act . '</td><td>' . $stat . '</td><td>' . $det . '</td></tr>';
+				. esc_html(get_the_title($id) ?: '(no title)') . '</a> <small>[' . esc_html(self::stlabel($p->post_status)) . ']</small><br><a href="' . esc_url(get_preview_post_link($id)) . '" target="_blank">Preview (check on phone)</a></td><td><span class="dcs-b dcs-b-' . esc_attr($key) . '">' . esc_html($labels[$key]) . '</span>' . $act . '</td><td>' . $stat . '</td><td>' . $det . '</td></tr>';
 		}
 		$tz = new DateTimeZone(self::AUD_TZ);
 		$start = (new DateTime('tomorrow', $tz))->format('Y-m-d');
@@ -946,14 +1063,15 @@ final class DCS_Plugin {
 		?>
 		<div class="wrap dcs">
 			<h1>Draft Checker &amp; Scheduler</h1>
-			<p><b><?php echo count($ids); ?></b> drafts &nbsp;|&nbsp; ✅ OK: <b><?php echo $cnt['ok']; ?></b> &nbsp; ⚠ Warnings: <b><?php echo $cnt['warn']; ?></b> &nbsp; ✖ Errors: <b><?php echo $cnt['error']; ?></b> &nbsp; ⏳ Not scanned / edited: <b><?php echo $cnt['stale']; ?></b></p>
+			<p><b><?php echo count($ids); ?></b> posts &nbsp;|&nbsp; ✅ OK: <b><?php echo $cnt['ok']; ?></b> &nbsp; ⚠ Warnings: <b><?php echo $cnt['warn']; ?></b> &nbsp; ✖ Errors: <b><?php echo $cnt['error']; ?></b> &nbsp; ⏳ Not scanned / edited: <b><?php echo $cnt['stale']; ?></b></p>
 
 			<div class="dcs-card">
-				<h2>1. Scan drafts</h2>
-				<p>Scanning only checks, it never changes content. Every scan re-checks all drafts. After scanning, Fix buttons appear for issues that can be fixed automatically.</p>
+				<h2>1. Scan posts</h2>
+				<p>Scanning only checks, it never changes content. Every scan re-checks all listed posts. After scanning, Fix buttons appear for issues that can be fixed automatically.</p>
+				<p><b>Include:</b> <?php foreach (['draft' => 'Draft', 'pending' => 'Pending', 'publish' => 'Published', 'future' => 'Scheduled'] as $sk => $sl) echo '<label style="margin-right:14px"><input type="checkbox" class="dcs-st" value="' . esc_attr($sk) . '" ' . checked(in_array($sk, $sts, true), true, false) . '> ' . esc_html($sl) . '</label>'; ?><br><small>Changing this reloads the page. Fixing Published / Scheduled posts edits the live article right away (Undo fixes restores it). Only Draft / Pending posts are bulk-scheduled.</small></p>
 				<label><input type="checkbox" id="dcs-thumb" <?php checked(get_option('dcs_thumb', '1'), '1'); ?>> Warn if featured image is missing</label>
 				<p><label><b>Allowed image domains</b> (one per line or comma-separated, e.g. <code>res.cloudinary.com</code> or <code>res.cloudinary.com/your-cloud-name</code>; empty = skip this check)<br><textarea id="dcs-domains" rows="2" cols="50"><?php echo esc_textarea(get_option('dcs_domains', 'res.cloudinary.com')); ?></textarea></label></p>
-				<button class="button button-primary" id="dcs-scan">Scan all drafts</button>
+				<button class="button button-primary" id="dcs-scan">Scan all listed posts</button>
 				<div class="dcs-barwrap"><div id="dcs-bar"></div></div><span id="dcs-prog"></span>
 			</div>
 
@@ -972,7 +1090,7 @@ final class DCS_Plugin {
 
 			<div class="dcs-card">
 				<h2>2. Bulk schedule</h2>
-				<p>Only scanned, unchanged drafts that are OK are scheduled. Dates and time window are in the timezone you pick below (default: US Eastern, for a US audience). The preview also shows Bangladesh time.</p>
+				<p>Only scanned, unchanged Draft (and Pending, if ticked) posts that are OK are scheduled. Dates and time window are in the timezone you pick below (default: US Eastern, for a US audience). The preview also shows Bangladesh time.</p>
 				<table class="dcs-form">
 					<tr><td>Start date</td><td><input type="date" id="s-start" value="<?php echo esc_attr($start); ?>"></td>
 						<td>End date</td><td><input type="date" id="s-end" value="<?php echo esc_attr($end); ?>"></td></tr>
@@ -1106,8 +1224,13 @@ $('#dcs-savecfg').onclick=async()=>{
   const v=id=>$(id).value,c=id=>$(id).checked?'1':'0';
   $('#dcs-cprog').textContent=' Saving...';
   const r=await post('dcs_settings',{min_words:v('#c-min'),ending:c('#c-ending'),foreign:c('#c-foreign'),topimg:c('#c-topimg'),repo:v('#c-repo')});
-  $('#dcs-cprog').textContent=r.success?' Saved. Run "Scan all drafts" again.':' '+r.data;
+  $('#dcs-cprog').textContent=r.success?' Saved. Run "Scan" again.':' '+r.data;
 };
+document.querySelectorAll('.dcs-st').forEach(cb=>{cb.onchange=async()=>{
+  const v=[...document.querySelectorAll('.dcs-st')].filter(x=>x.checked).map(x=>x.value);
+  if(!v.length){cb.checked=true;return;}
+  await post('dcs_setstatus',{st:v});location.reload();
+};});
 $('#dcs-viewsched').onclick=()=>{const b=$('#dcs-schedlist');b.style.display=b.style.display==='none'?'':'none';};
 $('#dcs-undo').onclick=async()=>{
   if(!C.sched.length||!confirm('Set '+C.sched.length+' scheduled posts back to draft?'))return;
