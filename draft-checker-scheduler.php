@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Draft Checker & Scheduler
  * Description: Scans draft posts (broken HTML/blocks, cut-off articles, stray characters, image domains), then offers one-click fixes (per post, per category, or all) with undo, plus bulk scheduling of clean drafts.
- * Version: 4.2.0
+ * Version: 4.2.2
  * Author: Salman
  */
 if (!defined('ABSPATH')) exit;
@@ -1026,10 +1026,24 @@ final class DCS_Plugin {
 		elseif ($order === 'newest') $ids = array_reverse($ids);
 
 		$total = count($ids); $i = 0; $plan = []; $now = time() + 600;
-		for (; $d <= $end && $i < $total; $d->modify('+1 day')) {
-			$cnt = min(mt_rand($min, $max), $total - $i);
+		// Spread posts over the WHOLE date range: enough posts -> every day is used up to the end date; few posts -> random days.
+		$D = (int) $d->diff($end)->days + 1;
+		$use = min($total, $D * $max);
+		$k = $use > 0 ? max(1, min($D, intdiv($use, $min))) : 0;
+		$mid = $D > 2 ? range(1, $D - 2) : []; shuffle($mid);
+		$pick = ($k >= 2 && $D >= 2) ? array_merge([0, $D - 1], array_slice($mid, 0, $k - 2)) : [0]; // always use the first and the last date
+		$cn = array_fill_keys($pick, min($min, $use));
+		for ($rem = $use - array_sum($cn); $rem > 0; $rem--) {
+			$c = array_keys(array_filter($cn, function ($v) use ($max) { return $v < $max; }));
+			if (!$c) break;
+			$cn[$c[array_rand($c)]]++;
+		}
+		ksort($cn);
+		foreach ($cn as $di => $cnt) {
+			$day = (clone $d)->modify('+' . (int) $di . ' day');
+			$cnt = min($cnt, $total - $i);
 			foreach (($mode === 'peak' ? self::peak($cnt, $gap) : self::slots($cnt, $a, $b, $gap)) as $mins) {
-				$dt = clone $d;
+				$dt = clone $day;
 				$dt->setTime(intdiv($mins, 60), $mins % 60, mt_rand(0, 59));
 				$ts = $dt->getTimestamp();
 				if ($ts < $now) continue;
