@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Draft Checker & Scheduler
  * Description: Scans draft posts (broken HTML/blocks, cut-off articles, stray characters, image domains), then offers one-click fixes (per post, per category, or all) with undo, plus bulk scheduling of clean drafts.
- * Version: 4.1.0
+ * Version: 4.2.0
  * Author: Salman
  */
 if (!defined('ABSPATH')) exit;
@@ -11,7 +11,7 @@ final class DCS_Plugin {
 	const SLUG = 'draft-checker-scheduler';
 	const VOID = ['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'];
 	const TZ = 'Asia/Dhaka'; // scheduling timezone (UTC+6)
-	const VER = '11';
+	const VER = '12';
 	const MARK = '/(?:={2,}\s*[A-Za-z][A-Za-z0-9_ \-]{0,30}?\s*={2,})|(?:(?:-{3,}|#{3,}|\*{3,}|_{3,})\s*[A-Z][A-Z0-9_ \-]{1,30}?\s*(?:-{3,}|#{3,}|\*{3,}|_{3,}))/u';
 	const REPO = 'https://github.com/skeee03/draft-checker-scheduler'; // GitHub repo used for auto-updates (can be overridden on the plugin page)
 	const AUD_TZ = 'America/New_York'; // default audience timezone (US Eastern)
@@ -38,7 +38,7 @@ final class DCS_Plugin {
 
 	static function init() {
 		add_action('admin_menu', [__CLASS__, 'menu']);
-		foreach (['scan', 'preview', 'apply', 'unsched', 'restore', 'fix', 'settings', 'setstatus'] as $a) add_action('wp_ajax_dcs_' . $a, [__CLASS__, 'ajax_' . $a]);
+		foreach (['scan', 'preview', 'apply', 'unsched', 'restore', 'fix', 'keep', 'settings', 'setstatus'] as $a) add_action('wp_ajax_dcs_' . $a, [__CLASS__, 'ajax_' . $a]);
 	}
 
 	// GitHub auto-updates (single file, no library). WordPress checks the latest *Release* of your GitHub repo; when its tag
@@ -124,8 +124,10 @@ final class DCS_Plugin {
 		$words = count($parts);
 		if ($words < apply_filters('dcs_min_words', max(0, (int) get_option('dcs_min_words', 150)))) $add('error', "Very short or empty content ($words words)");
 
-		if (!preg_match('/<img\b[^>]*>/i', $nocom)) $add('error', 'No images in article (0 images)');
-		elseif (apply_filters('dcs_check_top_image', get_option('dcs_topimg', '1') === '1') && !self::img_on_top($nocom)) $add('warn', 'No image at the top of the article (text comes before the first image)');
+		if (apply_filters('dcs_check_images', get_option('dcs_imgcheck', '1') === '1')) {
+			if (!preg_match('/<img\b[^>]*>/i', $nocom)) $add('error', 'No images in article (0 images)');
+			elseif (apply_filters('dcs_check_top_image', get_option('dcs_topimg', '1') === '1') && !self::img_on_top($nocom)) $add('warn', 'No image at the top of the article (text comes before the first image)');
+		}
 
 		$code = strpos($c, 'wp:code') !== false || stripos($c, '<pre') !== false;
 		if (!$code && preg_match('/&lt;\/?(p|h[1-6]|ul|ol|li|table|tr|td|th|div|strong|em|a|br)\b/i', $c)) {
@@ -156,6 +158,39 @@ final class DCS_Plugin {
 		$parts = $text === '' ? [] : preg_split('/\s+/u', $text);
 		if ($parts === false) $parts = preg_split('/\s+/', $text);
 		return ['w' => count($parts), 'i' => (int) preg_match_all('/<img\b[^>]*>/i', $nocom)];
+	}
+
+	// Images that sit one after another at the very start of the article (image block, figure, <p><img></p> or bare <img>).
+	// Returns [['s' => start offset, 'e' => end offset, 'src' => url], ...] (max 8).
+	static function lead_images($c, $max = 8) {
+		$re = [
+			'#\G\s*<!--\s*wp:image\b.*?-->\s*<figure\b.*?</figure>\s*<!--\s*/wp:image\s*-->#is',
+			'#\G\s*(?:<!--\s*wp:paragraph\b.*?-->\s*)?<p\b[^>]*>\s*(?:<a\b[^>]*>\s*)?<img\b[^>]*>\s*(?:</a>\s*)?</p>(?:\s*<!--\s*/wp:paragraph\s*-->)?#is',
+			'#\G\s*<figure\b[^>]*>(?:(?!</figure>).)*?<img\b.*?</figure>#is',
+			'#\G\s*(?:<a\b[^>]*>\s*)?<img\b[^>]*>\s*(?:</a>\s*)?#is',
+		];
+		$out = []; $pos = 0;
+		while (count($out) < $max) {
+			$hit = null;
+			foreach ($re as $r) {
+				if (preg_match($r, $c, $m, 0, $pos) === 1 && stripos($m[0], '<img') !== false) { $hit = $m[0]; break; }
+			}
+			if ($hit === null) break;
+			$src = preg_match('/<img\b[^>]*?\ssrc\s*=\s*["\']([^"\']+)["\']/i', $hit, $sm) ? html_entity_decode($sm[1]) : '';
+			$out[] = ['s' => $pos, 'e' => $pos + strlen($hit), 'src' => $src];
+			$pos += strlen($hit);
+		}
+		return $out;
+	}
+
+	// Keeps only the $keep-th (1-based) image of the leading run and removes the others. Returns new content or null.
+	static function keep_lead($c, $keep) {
+		$u = self::lead_images($c);
+		if (count($u) < 2 || $keep < 1 || $keep > count($u)) return null;
+		for ($k = count($u) - 1; $k >= 0; $k--) {
+			if ($k + 1 !== $keep) $c = substr_replace($c, '', $u[$k]['s'], $u[$k]['e'] - $u[$k]['s']);
+		}
+		return $c;
 	}
 
 	// True when no visible text comes before the first <img>.
@@ -806,6 +841,9 @@ final class DCS_Plugin {
 		update_post_meta($id, '_dcs_status', $status);
 		update_post_meta($id, '_dcs_issues', wp_slash($issues));
 		update_post_meta($id, '_dcs_stats', self::stats($p->post_content));
+		$lead = self::lead_images($p->post_content);
+		if (count($lead) >= max(2, (int) get_option('dcs_lead_min', 3))) update_post_meta($id, '_dcs_lead', wp_slash(array_column($lead, 'src')));
+		else delete_post_meta($id, '_dcs_lead');
 		update_post_meta($id, '_dcs_hash', md5($p->post_content));
 		update_post_meta($id, '_dcs_ver', self::VER);
 	}
@@ -834,6 +872,7 @@ final class DCS_Plugin {
 		self::guard();
 		$ids = self::ids_post();
 		update_option('dcs_thumb', ($_POST['thumb'] ?? '0') === '1' ? '1' : '0', false);
+		update_option('dcs_imgcheck', ($_POST['imgcheck'] ?? '1') === '1' ? '1' : '0', false);
 		$dm = sanitize_textarea_field(wp_unslash($_POST['domains'] ?? ''));
 		update_option('dcs_domains', $dm, false);
 		self::set_domains($dm);
@@ -847,6 +886,7 @@ final class DCS_Plugin {
 		$repo = trim($g('repo'));
 		if ($repo !== '' && !preg_match('#^https://github\.com/[\w.-]+/[\w.-]+/?$#i', $repo)) wp_send_json_error('GitHub repo must look like https://github.com/user/repo');
 		update_option('dcs_min_words', max(0, (int) $g('min_words', 150)), false);
+		update_option('dcs_lead_min', max(2, (int) $g('lead_min', 3)), false);
 		foreach (['ending', 'foreign', 'topimg'] as $k) update_option('dcs_' . $k, $g($k) === '1' ? '1' : '0', false);
 		update_option('dcs_repo', $repo, false);
 		wp_send_json_success();
@@ -874,6 +914,24 @@ final class DCS_Plugin {
 			$n++;
 		}
 		wp_send_json_success($n);
+	}
+
+	// Keep one of the images that sit in a row at the top of the article, remove the others (backup is saved, Undo fixes restores it).
+	static function ajax_keep() {
+		self::guard();
+		$id = (int) ($_POST['id'] ?? 0); $keep = (int) ($_POST['keep'] ?? 0);
+		$p = get_post($id);
+		if (!$p || !self::okst($p) || !self::fresh($id, $p)) wp_send_json_error('Post changed since the scan - scan again.');
+		$new = self::keep_lead($p->post_content, $keep);
+		if ($new === null || $new === $p->post_content) wp_send_json_error('Nothing to change.');
+		if (!get_post_meta($id, '_dcs_backup', true)) update_post_meta($id, '_dcs_backup', wp_slash($p->post_content));
+		$r = wp_update_post(['ID' => $id, 'post_content' => wp_slash($new)], true);
+		if (is_wp_error($r) || !$r) wp_send_json_error('Could not save the post.');
+		$old = array_filter((array) get_post_meta($id, '_dcs_fixes', true));
+		$old[] = 'Kept image ' . $keep . ' at the top, removed the other top images';
+		update_post_meta($id, '_dcs_fixes', wp_slash(array_values(array_unique($old))));
+		self::rescan($id);
+		wp_send_json_success(1);
 	}
 
 	static function ajax_unsched() {
@@ -955,12 +1013,12 @@ final class DCS_Plugin {
 		$d = new DateTime($sd . ' 00:00:00', $tz); $end = new DateTime($ed . ' 00:00:00', $tz);
 		if ($end < $d) wp_send_json_error('End date is before start date.');
 
-		$incl = $g('warn') === '1';
+		$incl = $g('warn') === '1'; $inclE = $g('err') === '1';
 		$ids = []; $stale = 0;
 		foreach (self::sched_ids() as $id) {
 			$st = self::fresh($id, get_post($id));
 			if (!$st) { $stale++; continue; }
-			if ($st === 'ok' || ($incl && $st === 'warn')) $ids[] = $id;
+			if ($st === 'ok' || ($incl && $st === 'warn') || ($inclE && $st === 'error')) $ids[] = $id;
 		}
 		$mode = $g('mode', 'peak');
 		$order = $g('order', 'oldest');
@@ -992,7 +1050,7 @@ final class DCS_Plugin {
 			$p = get_post($id);
 			if (!$p || !in_array($p->post_status, ['draft', 'pending'], true)) { $skipped[] = "#$id is not a draft/pending post"; continue; }
 			$st = self::fresh($id, $p);
-			if (!in_array($st, ['ok', 'warn'], true)) { $skipped[] = "#$id changed since scan"; continue; }
+			if (!in_array($st, ['ok', 'warn', 'error'], true)) { $skipped[] = "#$id changed since scan"; continue; }
 			if ($ts < time() + 60) { $skipped[] = "#$id time already passed"; continue; }
 			$gmt = gmdate('Y-m-d H:i:s', $ts);
 			update_post_meta($id, '_dcs_orig_date', [$p->post_date, $p->post_date_gmt, $p->post_status]);
@@ -1015,6 +1073,7 @@ final class DCS_Plugin {
 		$cnt = ['ok' => 0, 'warn' => 0, 'error' => 0, 'stale' => 0];
 		$labels = ['ok' => 'OK', 'warn' => 'Warnings', 'error' => 'Errors', 'stale' => 'Not scanned / edited'];
 		$fixmap = []; $allfix = []; $undo = [];
+		$imgOn = get_option('dcs_imgcheck', '1') === '1';
 		$rows = '';
 		foreach ($ids as $id) {
 			$p = get_post($id);
@@ -1025,7 +1084,7 @@ final class DCS_Plugin {
 			$det = ''; $act = ''; $stat = '—';
 			if ($key !== 'stale') {
 				$sx = get_post_meta($id, '_dcs_stats', true);
-				if (is_array($sx)) $stat = 'Words: <b>' . (int) $sx['w'] . '</b><br>Images: <b' . (empty($sx['i']) ? ' class="dcs-error"' : '') . '>' . (int) $sx['i'] . '</b>';
+				if (is_array($sx)) $stat = 'Words: <b>' . (int) $sx['w'] . '</b><br>Images: <b' . (($imgOn && empty($sx['i'])) ? ' class="dcs-error"' : '') . '>' . (int) $sx['i'] . '</b>';
 				$mine = [];
 				foreach ((array) $is as $i) {
 					$ic = $i['l'] === 'error' ? '✖ ' : ($i['l'] === 'info' ? 'ℹ ' : '⚠ ');
@@ -1033,6 +1092,14 @@ final class DCS_Plugin {
 					if (!empty($i['f'])) $mine[$i['f']] = 1;
 				}
 				foreach ((array) $fx as $f) if ($f) $det .= '<div class="dcs-fix">✔ Fixed: ' . esc_html($f) . '</div>';
+				$ld = get_post_meta($id, '_dcs_lead', true);
+				if (is_array($ld) && count($ld) >= 2) {
+					$det .= '<div class="dcs-lead"><b>' . count($ld) . ' images in a row at the top - keep one, remove the rest:</b><div class="dcs-leadrow">';
+					foreach ($ld as $k => $src) {
+						$det .= '<div>' . ($src !== '' ? '<img src="' . esc_url($src) . '" loading="lazy" alt="">' : '<span>(image)</span>') . '<br><button type="button" class="button button-small dcs-keep" data-id="' . (int) $id . '" data-keep="' . ($k + 1) . '" data-n="' . count($ld) . '">Keep ' . ($k + 1) . '</button></div>';
+					}
+					$det .= '</div></div>';
+				}
 				foreach (array_keys($mine) as $c) $fixmap[$c][] = (int) $id;
 				if ($mine) { $allfix[] = (int) $id; $act .= '<br><button type="button" class="button button-small dcs-fixone" data-id="' . (int) $id . '">Fix this post</button>'; }
 				if ($hasBackup) { $undo[] = (int) $id; $act .= '<br><a href="#" class="dcs-undo-fix" data-id="' . (int) $id . '">Undo fixes</a>'; }
@@ -1069,6 +1136,7 @@ final class DCS_Plugin {
 				<h2>1. Scan posts</h2>
 				<p>Scanning only checks, it never changes content. Every scan re-checks all listed posts. After scanning, Fix buttons appear for issues that can be fixed automatically.</p>
 				<p><b>Include:</b> <?php foreach (['draft' => 'Draft', 'pending' => 'Pending', 'publish' => 'Published', 'future' => 'Scheduled'] as $sk => $sl) echo '<label style="margin-right:14px"><input type="checkbox" class="dcs-st" value="' . esc_attr($sk) . '" ' . checked(in_array($sk, $sts, true), true, false) . '> ' . esc_html($sl) . '</label>'; ?><br><small>Changing this reloads the page. Fixing Published / Scheduled posts edits the live article right away (Undo fixes restores it). Only Draft / Pending posts are bulk-scheduled.</small></p>
+				<label><input type="checkbox" id="dcs-imgcheck" <?php checked(get_option('dcs_imgcheck', '1'), '1'); ?>> Check images (error if the article has no image, warning if no image at the top). Untick for sites without images.</label><br>
 				<label><input type="checkbox" id="dcs-thumb" <?php checked(get_option('dcs_thumb', '1'), '1'); ?>> Warn if featured image is missing</label>
 				<p><label><b>Allowed image domains</b> (one per line or comma-separated, e.g. <code>res.cloudinary.com</code> or <code>res.cloudinary.com/your-cloud-name</code>; empty = skip this check)<br><textarea id="dcs-domains" rows="2" cols="50"><?php echo esc_textarea(get_option('dcs_domains', 'res.cloudinary.com')); ?></textarea></label></p>
 				<button class="button button-primary" id="dcs-scan">Scan all listed posts</button>
@@ -1080,6 +1148,7 @@ final class DCS_Plugin {
 				<p>Scan again after changing these.</p>
 				<table class="dcs-form">
 					<tr><td>Minimum words (shorter = error)</td><td><input type="number" id="c-min" min="0" style="width:80px" value="<?php echo (int) get_option('dcs_min_words', 150); ?>"></td></tr>
+					<tr><td>Show "Keep image" buttons when this many images are in a row at the top</td><td><input type="number" id="c-lead" min="2" style="width:80px" value="<?php echo max(2, (int) get_option('dcs_lead_min', 3)); ?>"></td></tr>
 					<tr><td colspan="2"><label><input type="checkbox" id="c-ending" <?php checked(get_option('dcs_ending', '1'), '1'); ?>> Check for a Conclusion / FAQ / Summary ending</label></td></tr>
 					<tr><td colspan="2"><label><input type="checkbox" id="c-foreign" <?php checked(get_option('dcs_foreign', '1'), '1'); ?>> Warn about non-English characters</label></td></tr>
 					<tr><td colspan="2"><label><input type="checkbox" id="c-topimg" <?php checked(get_option('dcs_topimg', '1'), '1'); ?>> Warn if there is no image at the top of the article</label></td></tr>
@@ -1100,7 +1169,7 @@ final class DCS_Plugin {
 					<tr><td>Timezone</td><td colspan="3"><select id="s-tz"><?php foreach (self::$zones as $zk => $zl) echo '<option value="' . esc_attr($zk) . '"' . selected($zk, self::AUD_TZ, false) . '>' . esc_html($zl) . '</option>'; ?></select></td></tr>
 					<tr><td>Min gap (minutes)</td><td><input type="number" id="s-gap" value="100" min="0" style="width:70px"></td>
 						<td>Order</td><td><select id="s-order"><option value="oldest">Oldest draft first</option><option value="newest">Newest draft first</option><option value="random">Random</option></select></td></tr>
-					<tr><td colspan="4"><label><input type="checkbox" id="s-warn"> Also include drafts with warnings</label></td></tr>
+					<tr><td colspan="4"><label><input type="checkbox" id="s-warn"> Also include drafts with warnings</label> &nbsp;&nbsp; <label><input type="checkbox" id="s-err"> Also include drafts with errors</label></td></tr>
 				</table><br>
 				<button class="button" id="dcs-prev">Preview schedule</button>
 				<button class="button button-primary" id="dcs-apply" disabled>Apply schedule</button>
@@ -1128,6 +1197,7 @@ final class DCS_Plugin {
 			.dcs-barwrap{height:10px;background:#e0e0e0;margin-top:10px;max-width:400px}#dcs-bar{height:10px;width:0;background:#2271b1}
 			.dcs-form td{padding:4px 10px 4px 0}
 			.dcs-b{padding:2px 8px;border-radius:10px;font-size:12px;color:#fff}.dcs-b-ok{background:#00a32a}.dcs-b-warn{background:#dba617}.dcs-b-error{background:#d63638}.dcs-b-stale{background:#787c82}.dcs-b-sch{background:#2271b1}
+			.dcs-lead{margin-top:6px;padding:6px 8px;background:#f6f7f7;border:1px solid #dcdcde}.dcs-leadrow{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}.dcs-leadrow>div{text-align:center}.dcs-leadrow img{width:90px;height:90px;object-fit:cover;border:1px solid #c3c4c7}
 			.dcs-error{color:#b32d2e}.dcs-warn{color:#8a6100}.dcs-info{color:#50575e}.dcs-fix{color:#00700f}
 			#dcs-plan{max-height:320px;overflow:auto;margin-top:10px}#dcs-plan table td,#dcs-plan table th{padding:3px 12px 3px 0;text-align:left}
 		</style>
@@ -1164,7 +1234,7 @@ $('#dcs-scan').onclick=async()=>{
   const btn=$('#dcs-scan'),ids=C.ids.slice(),B=4;let done=0;btn.disabled=true;
   try{
     for(let i=0;i<ids.length;i+=B){
-      const res=await post('dcs_scan',{ids:ids.slice(i,i+B),thumb:$('#dcs-thumb').checked?'1':'0',domains:$('#dcs-domains').value});
+      const res=await post('dcs_scan',{ids:ids.slice(i,i+B),thumb:$('#dcs-thumb').checked?'1':'0',imgcheck:$('#dcs-imgcheck').checked?'1':'0',domains:$('#dcs-domains').value});
       if(!res.success)throw new Error(res.data||'request failed');
       done+=Math.min(B,ids.length-i);$('#dcs-bar').style.width=(done/ids.length*100)+'%';$('#dcs-prog').textContent=' '+done+' / '+ids.length;
     }
@@ -1185,10 +1255,14 @@ $('#dcs-undoall').onclick=async()=>{
   catch(e){alert('Stopped: '+e.message);}
 };
 document.addEventListener('click',async e=>{
-  const f=e.target.closest('.dcs-fixone'),u=e.target.closest('.dcs-undo-fix');
-  if(!f&&!u)return;e.preventDefault();
+  const f=e.target.closest('.dcs-fixone'),u=e.target.closest('.dcs-undo-fix'),k=e.target.closest('.dcs-keep');
+  if(!f&&!u&&!k)return;e.preventDefault();
   try{
-    if(f){await batch('dcs_fix',[Number(f.dataset.id)],{cats:[]});}
+    if(k){
+      if(!confirm('Keep image '+k.dataset.keep+' and remove the other '+(Number(k.dataset.n)-1)+' image(s) at the top? (Undo fixes is available)'))return;
+      const r=await post('dcs_keep',{id:k.dataset.id,keep:k.dataset.keep});
+      if(!r.success)throw new Error(r.data||'failed');
+    }else if(f){await batch('dcs_fix',[Number(f.dataset.id)],{cats:[]});}
     else{if(!confirm('Restore the content this post had before the fixes?'))return;await batch('dcs_restore',[Number(u.dataset.id)]);}
     location.reload();
   }catch(err){alert('Failed: '+err.message);}
@@ -1198,7 +1272,7 @@ let PLAN=[];
 $('#dcs-prev').onclick=async()=>{
   const g=id=>$(id).value;
   $('#dcs-sprog').textContent=' Calculating...';$('#dcs-apply').disabled=true;
-  const res=await post('dcs_preview',{start:g('#s-start'),end:g('#s-end'),min:g('#s-min'),max:g('#s-max'),from:g('#s-from'),to:g('#s-to'),gap:g('#s-gap'),tz:g('#s-tz'),order:g('#s-order'),mode:g('#s-mode'),warn:$('#s-warn').checked?'1':'0'});
+  const res=await post('dcs_preview',{start:g('#s-start'),end:g('#s-end'),min:g('#s-min'),max:g('#s-max'),from:g('#s-from'),to:g('#s-to'),gap:g('#s-gap'),tz:g('#s-tz'),order:g('#s-order'),mode:g('#s-mode'),warn:$('#s-warn').checked?'1':'0',err:$('#s-err').checked?'1':'0'});
   if(!res.success){$('#dcs-sprog').textContent=' '+res.data;return;}
   const d=res.data;PLAN=d.plan;
   let h='<p><b>'+d.plan.length+'</b> of '+d.eligible+' eligible drafts fit in this date range'+(d.left>0?' — <b style="color:#b32d2e">'+d.left+' left unscheduled</b> (extend the end date or raise posts/day)':'')+(d.stale>0?'. '+d.stale+' draft(s) skipped because they are not scanned or were edited after the scan':'')+'.</p>';
@@ -1223,7 +1297,7 @@ $('#dcs-apply').onclick=async()=>{
 $('#dcs-savecfg').onclick=async()=>{
   const v=id=>$(id).value,c=id=>$(id).checked?'1':'0';
   $('#dcs-cprog').textContent=' Saving...';
-  const r=await post('dcs_settings',{min_words:v('#c-min'),ending:c('#c-ending'),foreign:c('#c-foreign'),topimg:c('#c-topimg'),repo:v('#c-repo')});
+  const r=await post('dcs_settings',{min_words:v('#c-min'),lead_min:v('#c-lead'),ending:c('#c-ending'),foreign:c('#c-foreign'),topimg:c('#c-topimg'),repo:v('#c-repo')});
   $('#dcs-cprog').textContent=r.success?' Saved. Run "Scan" again.':' '+r.data;
 };
 document.querySelectorAll('.dcs-st').forEach(cb=>{cb.onchange=async()=>{
